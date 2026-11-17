@@ -11,6 +11,7 @@ from . import parsers as P
 from . import refs
 from .fetch import FlashscoreNotFound, get_feed, get_graphql_optional, get_page
 from .matches import article_from_payload
+import fastjson
 
 # The ranking tab that anchors each sport's ranking page — the feed answers
 # for any ranking id of the sport, and its `ME` block then lists the rest.
@@ -143,7 +144,7 @@ def get_news(sport):
     if text.lstrip().startswith("{"):
         import json
         try:
-            payload = json.loads(text)
+            payload = fastjson.loads(text)
         except ValueError:
             payload = {}
     sections = []

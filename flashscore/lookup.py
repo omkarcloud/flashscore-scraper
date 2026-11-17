@@ -14,9 +14,11 @@ off the entity's own page and memoised:
 
 Both resolvers return a small dict and are cached in-process (the pages are
 0.7-1.4 MB; the ids behind them change at most once a season). The contexts
-also carry the page itself and its embedded page-one results/fixtures, which
-DO move, so they expire after CONTEXT_TTL; only the bare slugs live on. The
-cache is bounded and holds no user input.
+carry the parsed stages/seasons and the embedded page-one results/fixtures
+— never the HTML itself (until 2026-10-23 each entry held the ~1 MB page
+under the 512 cap, hundreds of MB in a burst) — and since those DO move,
+they expire after CONTEXT_TTL; only the bare slugs live on.
+The cache is bounded and holds no user input.
 """
 import threading
 import time
@@ -94,10 +96,12 @@ def team_page(ref, *, tab=""):
 
 
 def team_context(ref):
-    """{sport_id, name, country, logo, feeds} for a team, from its page.
+    """{sport_id, name, country, logo, venue, feeds, stages, seasons} for a
+    team, from its page.
 
     `feeds` carries the embedded page-one results/fixtures blocks so a caller
-    that only wants page one never issues a second request."""
+    that only wants page one never issues a second request; `stages` and
+    `seasons` are the competitions the page's `window.environment` lists."""
     team_id = ref["id"] if isinstance(ref, dict) else ref
     cached = _recall(_teams, team_id, CONTEXT_TTL)
     if cached is not None:
@@ -121,7 +125,10 @@ def team_context(ref):
         "logo": logo.get("src") if logo is not None else None,
         "venue": _venue(soup),
         "feeds": P.initial_feeds(html),
-        "html": html,
+        "stages": [{"id": P.clean_id(s.get("id")), "name": P.clean(s.get("name")),
+                    "type": P.clean(s.get("statsType")), "country_id": P.to_int(s.get("countryId"))}
+                   for s in ((environment.get("stages_group") or {}).get("stages") or [])],
+        "seasons": _seasons(environment),
     }
     if not context["sport_id"]:
         raise FlashscoreNotFound(f"team {team_id} not found")
@@ -235,7 +242,6 @@ def tournament_context(ref):
         "stages": [{"id": P.clean_id(s.get("id")), "name": P.clean(s.get("name")),
                     "type": P.clean(s.get("statsType"))} for s in stages],
         "feeds": feeds,
-        "html": html,
     }
     if not context["sport_id"]:
         raise FlashscoreNotFound(f"competition {path} not found")
@@ -265,7 +271,7 @@ def ids_only(ref):
         "path": None, "sport_id": None, "country_id": None,
         "tournament_id": ref.get("tournament_id"), "stage_id": ref.get("stage_id"),
         "template_id": None, "season_id": None, "season_name": None,
-        "name": None, "seasons": [], "stages": [], "feeds": {}, "html": "",
+        "name": None, "seasons": [], "stages": [], "feeds": {},
     }
 
 

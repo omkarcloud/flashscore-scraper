@@ -161,7 +161,7 @@ class MatchStandingsSchema(MatchSchema):
 class MatchOddsSchema(MatchSchema):
     # ChoiceField lower-cases plain lists, so the upstream's SCREAMING_CASE
     # tokens are declared as an explicit public -> upstream map.
-    bet_type = ChoiceField({t.lower().replace("_", "-"): t for t in refs.BETTING_TYPES})
+    bet_type = ChoiceField(dict(refs.BETTING_TYPES))
     bet_scope = ChoiceField({s.lower().replace("_", "-"): s for s in refs.BETTING_SCOPES})
     geo = StrippedString(required=False, load_default="US",
                          validate=validate.Length(min=2, max=2),

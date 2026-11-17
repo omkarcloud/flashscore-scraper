@@ -14,6 +14,8 @@ table, TTS top scorers, MH point-by-point, DR draw, NF news, TV broadcasts).
 Every detail endpoint returns that list as `available_tabs` so a caller can
 tell "this match has no line-ups" from "the request failed".
 """
+import re
+
 from . import parsers as P
 from . import refs
 from .fetch import (FlashscoreNotFound, gather, get_feed, get_graphql,
@@ -319,9 +321,16 @@ def _with_core(match_id, extra):
     return result
 
 
+def _stat_label(type_id):
+    """A readable name for a stat type the upstream ships without a label:
+    PENALTIES_COMMITTED -> "Penalties committed"."""
+    text = P.clean(type_id)
+    return text.replace("_", " ").capitalize() if text else None
+
+
 def get_summary(match):
     """`df_sui_` — the incident list (goals, cards, substitutions, VAR) with
-    the running score at the start of each period."""
+    the score of each period and the running score after every goal."""
     match_id = _mid(match)
     core, text = run_parallel([lambda: _core(match_id),
                                lambda: _feed(f"df_sui_{_SPORT_SLOT}_{match_id}")])
@@ -330,8 +339,10 @@ def get_summary(match):
     for record in P.parse_records(text):
         if "AC" in record and "III" not in record:
             current = {"period": P.clean(record.get("AC")),
-                       "home_score_at_start": P.to_int(record.get("IG")),
-                       "away_score_at_start": P.to_int(record.get("IH")),
+                       # IG/IH are the goals scored IN this period (1st half
+                       # 0-2, 2nd half 1-1 for a 1-3), not a running score.
+                       "home_score": P.to_int(record.get("IG")),
+                       "away_score": P.to_int(record.get("IH")),
                        "incidents": []}
             periods.append(current)
             continue
@@ -349,12 +360,13 @@ def get_summary(match):
                                    link_path=record.get("IU")),
             "assist_player": P.player_ref(record.get("IN"), record.get("IO"),
                                           link_path=record.get("IP")),
-            "home_score": P.to_int(record.get("IG")),
-            "away_score": P.to_int(record.get("IH")),
+            # The running score after a goal lives in INX/IOX.
+            "home_score": P.to_int(record.get("INX")),
+            "away_score": P.to_int(record.get("IOX")),
         }
         if current is None:
-            current = {"period": None, "home_score_at_start": None,
-                       "away_score_at_start": None, "incidents": []}
+            current = {"period": None, "home_score": None,
+                       "away_score": None, "incidents": []}
             periods.append(current)
         current["incidents"].append(incident)
     result = _core_summary(match_id, core)
@@ -421,18 +433,24 @@ def get_lineups(match):
     sides = {"home": {"formation": None, "rating": None, "groups": []},
              "away": {"formation": None, "rating": None, "groups": []}}
     group_name = None
+    side = "home"
     for record in P.parse_records(text):
-        if "LB" in record and "LP" not in record:
-            group_name = P.clean(record.get("LB"))
-            continue
+        # Each group ("Starting Lineups", "Substitutes", "Coaches") holds an
+        # `LC÷1` block of home players then an `LC÷2` block of away players;
+        # the marker record opens the block (LK on a player is NOT the side).
         if "LP" not in record:
+            if "LB" in record:
+                group_name = P.clean(record.get("LB"))
+            if "LC" in record:
+                side = "away" if P.to_int(record.get("LC")) == 2 else "home"
             continue
-        side = "home" if P.to_int(record.get("LK")) == 1 else "away"
         entry = sides[side]
         if record.get("LD"):
             entry["formation"] = P.clean(record.get("LD"))
-        if record.get("LRH"):
-            entry["rating"] = P.to_float(record.get("LRH"))
+        # The team rating rides on the side's first player: LRH home, LRA away.
+        team_rating = record.get("LRH") or record.get("LRA")
+        if team_rating:
+            entry["rating"] = P.to_float(team_rating)
         player = {
             "player": P.player_ref(record.get("LP"), record.get("LI"),
                                    image_path=record.get("LPI"), link_path=record.get("NU")),
@@ -504,7 +522,7 @@ def get_player_statistics(match):
             definition = types.get(entry.get("typeId")) or {}
             stats.append({
                 "id": P.clean(entry.get("typeId")),
-                "name": P.clean(definition.get("label")) or P.clean(entry.get("typeId")),
+                "name": P.clean(definition.get("label")) or _stat_label(entry.get("typeId")),
                 "value": P.clean(entry.get("value")),
                 "numeric_value": P.to_float(entry.get("rawValue")),
             })
@@ -688,8 +706,9 @@ def get_point_by_point(match, set=None):
             "away_games": P.to_int(record.get("HE")),
             "server": {1: "home", 2: "away"}.get(P.to_int(record.get("HG"))),
             "winner": {1: "home", 2: "away"}.get(P.to_int(record.get("HK"))),
-            "is_break": P.to_bool(record.get("HH")),
-            "points": [p.strip() for p in (P.clean(record.get("HL")) or "").split(",") if p.strip()],
+            # HH names the side that lost its serve, so any value is a break.
+            "is_break": bool(P.clean(record.get("HH"))),
+            "points": [_point(p) for p in (P.clean(record.get("HL")) or "").split(",") if p.strip()],
         })
     if set:
         wanted = str(set).strip().lower()
@@ -701,6 +720,19 @@ def get_point_by_point(match, set=None):
     result["sets"] = sets
     result["current_game"] = _current_game(live)
     return result
+
+
+# A point's score carries trailing markers: |B1| break point, |B2| set
+# point, |B3| match point (read off set- and match-ending games).
+_POINT_MARKER_RE = re.compile(r"\|([A-Z]\d+)\|")
+
+
+def _point(text):
+    markers = set(_POINT_MARKER_RE.findall(text))
+    return {"score": P.clean(_POINT_MARKER_RE.sub("", text)),
+            "is_break_point": "B1" in markers,
+            "is_set_point": "B2" in markers,
+            "is_match_point": "B3" in markers}
 
 
 def _current_game(text):
@@ -765,17 +797,17 @@ def get_odds(match, bet_type=None, bet_scope=None, geo="US"):
             continue
         if bet_scope and (row.get("bettingScope") or "").upper() != bet_scope.upper():
             continue
+        market_type = (row.get("bettingType") or "").upper()
         selections = []
         for odd in row.get("odds") or []:
-            # An odds row identifies its pick by event-participant id; the
-            # one with no participant is the draw.
-            participant = P.clean(odd.get("eventParticipantId"))
+            handicap = odd.get("handicap")
+            if isinstance(handicap, dict):
+                handicap = handicap.get("value")
             selections.append({
-                "selection": sides.get(participant) if participant
-                else (P.clean(odd.get("selection")) or P.clean(odd.get("winner")) or "draw"),
+                "selection": _odds_selection(market_type, odd, sides),
                 "value": P.to_float(odd.get("value")),
                 "opening_value": P.to_float(odd.get("opening")),
-                "handicap": P.clean(odd.get("handicap")),
+                "handicap": P.to_float(handicap),
                 "score": P.clean(odd.get("score")),
                 "is_active": bool(odd.get("active")),
             })
@@ -793,6 +825,31 @@ def get_odds(match, bet_type=None, bet_scope=None, geo="US"):
     result["market_count"] = len(markets)
     result["markets"] = markets
     return result
+
+
+# Double chance names the team that goes WITH the draw; the pick with no
+# participant is "either team wins".
+_DOUBLE_CHANCE = {"home": "home_or_draw", "away": "draw_or_away", None: "home_or_away"}
+
+
+def _odds_selection(market_type, odd, sides):
+    """The pick an odds item stands for. Markets name it in different fields:
+    a participant id (1X2, handicaps, draw no bet), `selection` (over/under,
+    odd/even), `bothTeamsToScore`, `score` (correct score) or `winner`
+    (half-time/full-time, e.g. "1/X")."""
+    participant = P.clean(odd.get("eventParticipantId"))
+    side = sides.get(participant) if participant else None
+    if market_type == "DOUBLE_CHANCE":
+        return _DOUBLE_CHANCE.get(side)
+    if isinstance(odd.get("bothTeamsToScore"), bool):
+        return "yes" if odd["bothTeamsToScore"] else "no"
+    for key in ("selection", "score", "winner"):
+        text = P.clean(odd.get(key))
+        if text:
+            return text.lower() if key == "selection" else text
+    if participant:
+        return side
+    return "draw"
 
 
 def _participant_sides(match_id):

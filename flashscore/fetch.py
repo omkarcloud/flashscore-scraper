@@ -46,14 +46,17 @@ import re
 import sys
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait as wait_futures
 
 # Allow direct execution (python flashscore/fetch.py): flat imports resolve
 # like under the server. Idempotent when imported normally.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import config
+import egress
+import identity_pool
 from scraper_errors import BadRequest, Blocked, NotFound, UpstreamError
+from scraper_utils import debug, fanout, sessions
 
 SITE = "https://www.flashscore.com"
 FEED = "https://global.flashscore.ninja/2/x/feed/"
@@ -74,19 +77,19 @@ EMPTY_BODIES = ("", "0", "A1÷¬~")
 
 FEED_HEADERS = {
     "accept": "*/*",
-    "accept-language": "en-US,en;q=0.9",
+    "accept-language": egress.site_accept_language("flashscore"),
     "referer": SITE + "/",
     "origin": SITE,
 }
 JSON_HEADERS = {
     "accept": "*/*",
-    "accept-language": "en-US,en;q=0.9",
+    "accept-language": egress.site_accept_language("flashscore"),
     "referer": SITE + "/",
     "origin": SITE,
 }
 PAGE_HEADERS = {
     "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-    "accept-language": "en-US,en;q=0.9",
+    "accept-language": egress.site_accept_language("flashscore"),
     "upgrade-insecure-requests": "1",
 }
 
@@ -135,64 +138,61 @@ def _session():
 
 def _drop_session():
     """Close the thread's session so a poisoned exit / keep-alive dies."""
-    sess = getattr(_local, "session", None)
-    _local.session = None
-    if sess is not None:
-        try:
-            sess.close()
-        except Exception:
-            pass
+    sessions.drop(_local)
 
 
 def dump_debug(name, text):
     """Write a raw response to $FLASHSCORE_DEBUG_DIR/<name>.txt."""
-    dbg = os.environ.get("FLASHSCORE_DEBUG_DIR", "")
-    if dbg and text:
-        try:
-            os.makedirs(dbg, exist_ok=True)
-            with open(os.path.join(dbg, name + ".txt"), "w") as f:
-                f.write(text)
-        except OSError:
-            pass
+    debug.dump("FLASHSCORE_DEBUG_DIR", name, text)
 
 
 # ---- feed signature --------------------------------------------------------------
 # The feed host answers 401 without `x-fsign`. The token is a build constant
-# printed in every page; we seed from config and re-read the homepage once if
-# the seeded value ever stops working.
+# printed in every page. It lives in a shared identity_pool (seeded from
+# config, replaced the hand-rolled `_sign` global + lock on 2026-11-09): a
+# 401 wave across the 64 request threads costs ONE homepage read, the other
+# threads get the winner's value, and a second refresh inside
+# SIGN_REFRESH_INTERVAL returns the same token (a block is not a rotation).
 _SIGN_RE = re.compile(r"feed_sign\s*[:=]\s*[\"']([A-Za-z0-9_-]{4,32})[\"']")
-_sign = None
-_sign_lock = threading.Lock()
+SIGN_REFRESH_INTERVAL = 30     # seconds between two homepage re-reads
+
+
+def _mint_sign(key, hint):
+    """The pool's mint: read feed_sign from the homepage. Raises
+    FlashscoreUpstreamError when the page does not carry it."""
+    sess = _session()
+    resp = sess.get(SITE + "/", headers=PAGE_HEADERS, timeout=PAGE_TIMEOUT)
+    match = _SIGN_RE.search(resp.text or "")
+    if not match:
+        raise FlashscoreUpstreamError("feed_sign not found on the homepage")
+    return match.group(1)
+
+
+_signs = identity_pool.Pool("flashscore-feed-sign", _mint_sign, min_interval=SIGN_REFRESH_INTERVAL,
+                            seed={"": config.FLASHSCORE_FEED_SIGN})
 
 
 def feed_sign():
-    global _sign
-    if _sign is None:
-        _sign = config.FLASHSCORE_FEED_SIGN
-    return _sign
+    """The current x-fsign value (the seed until a 401 ever rotates it)."""
+    return _signs.get().value
 
 
-def _refresh_sign():
-    """Re-read feed_sign from the homepage. Returns the new value or None."""
-    global _sign
-    with _sign_lock:
-        current = _sign
-        try:
-            sess = _session()
-            resp = sess.get(SITE + "/", headers=PAGE_HEADERS, timeout=PAGE_TIMEOUT)
-            match = _SIGN_RE.search(resp.text or "")
-        except Exception as e:
-            print(f"flashscore: feed_sign refresh failed: {type(e).__name__}: {e}")
-            return None
-        if not match:
-            print("flashscore: feed_sign not found on the homepage")
-            return None
-        found = match.group(1)
-        if found == current:
-            return None            # same token — a refresh would not help
-        print(f"flashscore: feed_sign rotated {current} -> {found}")
-        _sign = found
-        return found
+def _refresh_sign(used):
+    """`used` (the pool identity whose value just got a 401) is stale: ask the
+    pool for its replacement. One harvest per 401 wave (compare-and-swap)
+    and at most one per SIGN_REFRESH_INTERVAL. Returns the new value, or
+    None when the token is unchanged or the harvest failed (same contract
+    as the old global: the caller retries with whatever feed_sign() says)."""
+    current = used.value
+    try:
+        fresh = _signs.get(replace=used)
+    except Exception as e:
+        print(f"flashscore: feed_sign refresh failed: {type(e).__name__}: {e}")
+        return None
+    if fresh.value == current:
+        return None            # same token — a refresh would not help
+    print(f"flashscore: feed_sign rotated {current} -> {fresh.value}")
+    return fresh.value
 
 
 # ---- requests --------------------------------------------------------------------
@@ -254,14 +254,16 @@ def get_feed(name, *, optional=False):
     with optional=True it also returns "" (tabs that simply do not exist
     for a sport must not 404 the whole endpoint)."""
     url = FEED + name
+    used = [None]              # the sign identity the last attempt sent
 
     def once():
-        headers = dict(FEED_HEADERS, **{"x-fsign": feed_sign()})
+        used[0] = _signs.get()
+        headers = dict(FEED_HEADERS, **{"x-fsign": used[0].value})
         resp = _get(url, headers=headers, timeout=FEED_TIMEOUT, label=f"feed {name}")
         return resp.text
 
     try:
-        text = _retrying(once, on_unauthorized=_refresh_sign)
+        text = _retrying(once, on_unauthorized=lambda: _refresh_sign(used[0]))
     except FlashscoreNotFound:
         if optional:
             return ""
@@ -358,6 +360,24 @@ def get_page(path, *, expect=None, optional=False):
         raise
 
 
+# Long-lived pools (2026-10-23): their threads keep their thread-local curl
+# sessions — and the sticky exits behind them — between requests. The
+# per-call executor they replace opened fresh sessions/exits for every
+# fan-out and threw them away when the call returned. Two levels: a fan-out
+# running inside a fan-out goes to the second pool, so it neither waits on
+# the workers it occupies (deadlock) nor loses its parallelism; a third
+# level runs inline.
+_pools = (ThreadPoolExecutor(max_workers=FANOUT_WORKERS * 4, thread_name_prefix="flashscore-fanout-0"),
+          ThreadPoolExecutor(max_workers=FANOUT_WORKERS * 4, thread_name_prefix="flashscore-fanout-1"))
+
+
+def _windowed(fns, workers):
+    """Run `fns` on the pool for this nesting level, at most `workers` at a
+    time; results align with `fns`. The first failure (in `fns` order)
+    propagates once the callables already started have finished."""
+    return fanout.windowed(_pools, "flashscore-fanout", fns, workers)
+
+
 def run_parallel(fns):
     """Run zero-arg callables in parallel; results align with `fns`.
     Exceptions propagate from the first failing call."""
@@ -365,27 +385,14 @@ def run_parallel(fns):
         return []
     if len(fns) == 1:
         return [fns[0]()]
-    with ThreadPoolExecutor(max_workers=min(FANOUT_WORKERS, len(fns))) as ex:
-        futures = [ex.submit(fn) for fn in fns]
-        return [f.result() for f in futures]
+    return _windowed(fns, FANOUT_WORKERS)
 
 
 def gather(mapping):
     """Run {key: callable} in parallel -> {key: result}, where a NotFound or
     BadRequest for one key yields None instead of failing the whole set.
     Used by endpoints that stitch several optional tabs together."""
-    keys = list(mapping)
-
-    def guarded(fn):
-        def run():
-            try:
-                return fn()
-            except (FlashscoreNotFound, FlashscoreBadRequest):
-                return None
-        return run
-
-    results = run_parallel([guarded(mapping[k]) for k in keys])
-    return dict(zip(keys, results))
+    return fanout.gather(run_parallel, mapping, (FlashscoreNotFound, FlashscoreBadRequest))
 
 
 if __name__ == "__main__":

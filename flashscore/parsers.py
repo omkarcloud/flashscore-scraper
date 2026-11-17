@@ -35,7 +35,7 @@ them), the per-bookmaker affiliate link tracking (`BU` query strings), the
 six image size variants per player (one canonical size is kept), and the
 GraphQL `__typename`/`subscriptionSubjects`/`shouldUpdate` plumbing.
 """
-import json
+import fastjson
 import re
 from datetime import datetime, timezone
 
@@ -376,8 +376,9 @@ def _period_scores(row, sport_id):
 
 def _period_name(sport_id, index):
     if sport_id == 1:
-        # Football only ever fills slot 2, and it means half time.
-        return "Half Time" if index == 2 else f"Period {index}"
+        # The day feed carries the second half in slot 2 (BC/BD) — checked
+        # against the incident list of 15 finished matches.
+        return {1: "1st Half", 2: "2nd Half"}.get(index, f"Period {index}")
     if sport_id in (2, 12, 17, 25, 21):        # racket / net sports
         return f"Set {index}"
     if sport_id in (3, 5, 18):                  # basketball, gridiron, AFL
@@ -462,7 +463,8 @@ def match_row(row, header=None, *, sport_id=None):
         "away_score": away_score,
         "winner": {1: "home", 2: "away", 0: "draw"}.get(winner),
         "periods": periods or None,
-        "has_statistics": to_bool(row.get("AX")),
+        # `AX` is not a statistics flag (matches with AX÷0 carry the tab too),
+        # so list rows leave has_statistics to the match endpoints.
         "has_live_coverage": to_bool(row.get("AN")),
     }
     if header:
@@ -578,7 +580,7 @@ def js_object(html, marker):
             depth -= 1
             if depth == 0:
                 try:
-                    return json.loads(html[open_brace:index + 1])
+                    return fastjson.loads(html[open_brace:index + 1])
                 except ValueError:
                     return {}
     return {}

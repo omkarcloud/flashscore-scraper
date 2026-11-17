@@ -35,19 +35,16 @@ def get_details(team):
     """The team card: name, country, crest, venue and the competitions it is
     currently entered in."""
     context = lookup.team_context(_ref(team))
-    environment = P.page_environment(context["html"])
-    stages = (environment.get("stages_group") or {}).get("stages") or []
     result = _identity(context)
     result.update({
         "venue": context.get("venue"),
-        "competitions": [{"stage_id": P.clean_id(s.get("id")), "name": P.clean(s.get("name")),
-                          "type": P.clean(s.get("statsType")),
-                          "country_id": P.to_int(s.get("countryId"))} for s in stages],
+        "competitions": [{"stage_id": s["id"], "name": s["name"], "type": s["type"],
+                          "country_id": s["country_id"]} for s in context["stages"]],
         "seasons": [{"name": P.clean(s.get("name")),
                      "tournament_id": s.get("tournament_id"), "stage_id": s.get("stage_id"),
                      "reference": f"{s['tournament_id']}:{s['stage_id']}"
                      if s.get("tournament_id") and s.get("stage_id") else None}
-                    for s in lookup._seasons(environment)],
+                    for s in context["seasons"]],
     })
     return result
 
@@ -238,12 +235,10 @@ def _player_path(path, player_id):
 def get_standings(team, type="overall", line="all"):
     """The table of the competition this team is currently in."""
     context = lookup.team_context(_ref(team))
-    environment = P.page_environment(context["html"])
-    seasons = lookup._seasons(environment)
-    stages = (environment.get("stages_group") or {}).get("stages") or []
+    seasons, stages = context["seasons"], context["stages"]
     tournament_id = seasons[0].get("tournament_id") if seasons else None
     stage_id = (seasons[0].get("stage_id") if seasons else None) or \
-        (P.clean_id(stages[0].get("id")) if stages else None)
+        (stages[0]["id"] if stages else None)
     if not tournament_id or not stage_id:
         raise ValueError("this team has no league table (cup-only or friendly squads "
                          "have none) — use /flashscore/tournaments/standings instead")
@@ -251,7 +246,7 @@ def get_standings(team, type="overall", line="all"):
     text = get_feed(f"to_{tournament_id}_{stage_id}_{tab}", optional=True)
     result = _identity(context)
     result["competition"] = {"id": tournament_id, "stage_id": stage_id,
-                             "name": P.clean(stages[0].get("name")) if stages else None}
+                             "name": stages[0]["name"] if stages else None}
     result.update(standings_payload(text, type, line))
     return result
 
@@ -259,12 +254,10 @@ def get_standings(team, type="overall", line="all"):
 def get_top_scorers(team):
     """The scoring chart of the competition this team is currently in."""
     context = lookup.team_context(_ref(team))
-    environment = P.page_environment(context["html"])
-    seasons = lookup._seasons(environment)
-    stages = (environment.get("stages_group") or {}).get("stages") or []
+    seasons, stages = context["seasons"], context["stages"]
     tournament_id = seasons[0].get("tournament_id") if seasons else None
     stage_id = (seasons[0].get("stage_id") if seasons else None) or \
-        (P.clean_id(stages[0].get("id")) if stages else None)
+        (stages[0]["id"] if stages else None)
     if not tournament_id or not stage_id:
         raise ValueError("this team has no competition scoring chart — "
                          "use /flashscore/tournaments/top-scorers instead")

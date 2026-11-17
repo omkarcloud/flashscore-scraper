@@ -103,8 +103,9 @@ def test_football_match_row_maps_scores_periods_and_teams():
     assert first["winner"] == "away"
     assert first["home"]["name"] == "Malaga" and first["away"]["name"] == "Villarreal"
     assert first["round"] == "Round 6"
-    # Football fills only the second period slot, and it is the half-time score.
-    assert first["periods"] == [{"name": "Half Time", "home": 0, "away": 1}]
+    # Football fills only the second period slot: the second-half score
+    # (1st half 1-2 per the incident list, so 0-1 after the break).
+    assert first["periods"] == [{"name": "2nd Half", "home": 0, "away": 1}]
 
 
 def test_match_rows_carry_their_competition_header():
@@ -347,3 +348,31 @@ def test_standings_tab_list_feed():
     records = P.parse_records(load("standings_tabs.txt"))
     tabs = next(r["TB"] for r in records if r.get("TB"))
     assert "1" in tabs.split(",") and "10" in tabs.split(",")
+
+
+# ---- lookup cache entries hold parsed fields, never the page ------------------
+
+def test_lookup_contexts_cache_parsed_fields_not_html(monkeypatch):
+    import json
+    from flashscore import lookup
+    # the only captured page with a window.environment blob is the league
+    # page; it stands in for the team page too (same blob, same heading)
+    html = load("league_page.html")
+    monkeypatch.setattr(lookup, "get_page", lambda path, expect=None: html)
+    lookup._tournaments.clear()
+    lookup._teams.clear()
+    tournament = lookup.tournament_context({"path": "/football/spain/laliga/"})
+    squad = lookup.team_context({"id": "pSUf5ctv", "slug": "real-madrid"})
+    for context in (tournament, squad):
+        assert "html" not in context and "environment" not in context
+        assert context["sport_id"] and context["stages"][0]["id"] and context["seasons"][0]["tournament_id"]
+        # the entry is the page-one feeds plus a few KB of ids: smaller than
+        # even this trimmed 84 KB capture, and ~30 KB against a 0.7-1.4 MB
+        # production page; the feed text is the bulk of it
+        size = len(json.dumps(context, default=str))
+        feeds = len(json.dumps(context["feeds"]))
+        assert size < len(html) and size - feeds < 16_000, f"cache entry {size} B vs page {len(html)} B"
+    assert squad["stages"][0]["country_id"] and squad["stages"][0]["name"]
+    assert lookup._tournaments["/football/spain/laliga/"][1] is tournament
+    assert lookup._teams["pSUf5ctv"][1] is squad
+    assert "html" not in lookup.ids_only({"tournament_id": "a", "stage_id": "b"})

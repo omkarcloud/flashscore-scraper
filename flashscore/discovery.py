@@ -42,7 +42,10 @@ def get_countries(sport):
     page's own country menu."""
     sport_id = refs.resolve_sport(sport)
     slug = refs.sport_slug(sport_id)
-    html = get_page(f"/{slug}/", expect=slug)
+    # 2026-10-06: /football/ now 200-redirects to the homepage (football is
+    # the site's default sport; the page and its country menu are the same),
+    # so the final-url check must not demand the slug for it.
+    html = get_page(f"/{slug}/", expect=None if slug == "football" else slug)
     soup = P.soup(html)
     seen = {}
     for anchor in soup.select(f"a[href^='/{slug}/']"):

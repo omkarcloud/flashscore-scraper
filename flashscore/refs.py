@@ -115,9 +115,12 @@ OVER_UNDER_LINES = {
 }
 
 # ---- odds -----------------------------------------------------------------------
-BETTING_TYPES = ["HOME_DRAW_AWAY", "HOME_AWAY", "OVER_UNDER",
-                 "BOTH_TEAMS_TO_SCORE", "DOUBLE_CHANCE", "ASIAN_HANDICAP",
-                 "CORRECT_SCORE", "HALF_TIME_FULL_TIME"]
+# Public slug -> the upstream's bettingType. Half-time/full-time is
+# HALF_FULL_TIME upstream (HALF_TIME_FULL_TIME matches nothing).
+BETTING_TYPES = {"home-draw-away": "HOME_DRAW_AWAY", "home-away": "HOME_AWAY",
+                 "over-under": "OVER_UNDER", "both-teams-to-score": "BOTH_TEAMS_TO_SCORE",
+                 "double-chance": "DOUBLE_CHANCE", "asian-handicap": "ASIAN_HANDICAP",
+                 "correct-score": "CORRECT_SCORE", "half-time-full-time": "HALF_FULL_TIME"}
 BETTING_SCOPES = ["FULL_TIME", "FIRST_HALF", "SECOND_HALF"]
 
 # ---- search ---------------------------------------------------------------------
